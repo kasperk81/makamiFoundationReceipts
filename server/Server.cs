@@ -1,3 +1,7 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading.Tasks;
 using MailKit.Net.Smtp;
 using MailKit.Security;
 using Microsoft.AspNetCore;
@@ -7,14 +11,13 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using MimeKit;
+using QuestPDF.Fluent;
+using QuestPDF.Infrastructure;
 using Stripe;
 using Stripe.Checkout;
-using System;
-using System.Collections.Generic;
-using System.ComponentModel.DataAnnotations;
-using System.IO;
-using System.Threading.Tasks;
+using StripeExample;
 
 public class StripeOptions
 {
@@ -29,11 +32,14 @@ namespace server.Controllers
         {
             WebHost
                 .CreateDefaultBuilder(args)
+                //Change in production
                 .UseUrls("http://0.0.0.0:4242")
                 .UseWebRoot("public")
                 .UseStartup<Startup>()
                 .Build()
                 .Run();
+            QuestPDF.Settings.License = LicenseType.Community;
+            // code in your main method
         }
     }
 
@@ -48,6 +54,7 @@ namespace server.Controllers
 
         public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
         {
+            QuestPDF.Settings.License = LicenseType.Community;
             // This is your test secret API key.
             StripeConfiguration.ApiKey =
                 "sk_test_51PY9wlAFhMxzwGjjtnMpqSd7iQcSajbWCsaAq6EIb6cTSKhp3OZ1dGwvEKkBVzKg5UnnH75WmkAFvFlef2jrtDOf00ad9s3hBS";
@@ -65,18 +72,17 @@ namespace server.Controllers
         }
     }
 
-    public class DonationRequest
-    {
-        [Required]
-        public string Email { get; set; }
-        public string DonationTowards { get; set; }
-        public string OnBehalfOf { get; set; }
-    }
-
     [Route("transaction")]
     [ApiController]
     public class CheckoutApiController : Controller
     {
+        private readonly ILogger<CheckoutApiController> _logger;
+
+        public CheckoutApiController(ILogger<CheckoutApiController> logger)
+        {
+            _logger = logger;
+        }
+
         [HttpPost("create-checkout-session")]
         public ActionResult Create(DonationRequest request)
         {
@@ -96,21 +102,17 @@ namespace server.Controllers
                 CancelUrl = "https://makamifoundation.com/Donate",
                 PaymentIntentData = new()
                 {
-                    Description = $"Charitable Donation Number: 84327 7211 RR0001",
-                    Metadata = new() { { "test", "test" } }
+                    Metadata = new()
+                    {
+                        { "DonationTowards", request.DonationTowards },
+                        { "DonationDetails", request.DonationDetails },
+                        { "Phone", request.Phone },
+                        { "FullName", request.FullName }
+                    }
                 },
                 CustomerEmail = request.Email,
             };
-            if (!string.IsNullOrWhiteSpace(request.DonationTowards))
-            {
-                options.PaymentIntentData.Description +=
-                    $", Donation made towards: {request.DonationTowards}";
-            }
-            if (!string.IsNullOrWhiteSpace(request.OnBehalfOf))
-            {
-                options.PaymentIntentData.Description +=
-                    $", Donation made on behalf of: {request.OnBehalfOf}";
-            }
+
             var service = new SessionService();
             Session session = service.Create(options);
 
@@ -126,47 +128,80 @@ namespace server.Controllers
             {
                 var stripeEvent = EventUtility.ParseEvent(json);
 
-                if (stripeEvent.Type == Events.PaymentIntentSucceeded)
-                {
-                    var intent = stripeEvent.Data.Object as PaymentIntent;
-
-                    MimeMessage email = new MimeMessage();
-                    MailboxAddress from = new MailboxAddress(
-                        "Makami Foundation",
-                        "makamiFoundation@makamicollege.com"
-                    );
-                    email.From.Add(from);
-                    email.Subject = "Donation Receipt to Makami Foundation";
-                    BodyBuilder bodyBuilder = new BodyBuilder();
-                    bodyBuilder.HtmlBody = "<p>Thank you for your donation!</p>";
-                    email.Body = bodyBuilder.ToMessageBody();
-                    SmtpClient client = new SmtpClient();
-
-                    await client.ConnectAsync(
-                        "proxy.makamicollege.com",
-                        25,
-                        SecureSocketOptions.None
-                    );
-
-                    MailboxAddress To = new MailboxAddress("TEST", intent.ReceiptEmail);
-                    email.To.Add(To);
-                    await client.SendAsync(email);
-                    await client.DisconnectAsync(true);
-                    client.Dispose();
-                }
-                else
+                if (stripeEvent.Type != Events.PaymentIntentSucceeded)
                 {
                     // Unexpected event type
-                    Console.WriteLine("Unhandled event type: {0}", stripeEvent.Type);
+                    _logger.LogWarning("Unhandled event type: {0}", stripeEvent.Type);
+                    return Ok();
                 }
+                var intent = stripeEvent.Data.Object as PaymentIntent;
+
+                ChargeService chargeService = new();
+                Charge charge = await chargeService.GetAsync(intent.LatestChargeId);
+                string emailString = intent.ReceiptEmail;
+                //TODO Change to intent.ReceiptNumber in Production
+                string receiptNumber = "1111-2222";
+                string fullName = intent.Metadata.GetValueOrDefault("FullName");
+
+                if (
+                    string.IsNullOrWhiteSpace(emailString)
+                    || string.IsNullOrWhiteSpace(receiptNumber)
+                )
+                {
+                    _logger.LogError("Email or receipt number null from Stripe.");
+                    return StatusCode(StatusCodes.Status400BadRequest);
+                }
+                if (string.IsNullOrWhiteSpace(fullName))
+                {
+                    _logger.LogError("Customer's name not provided");
+                    return StatusCode(StatusCodes.Status400BadRequest);
+                }
+
+                ReceiptData receiptData =
+                    new()
+                    {
+                        Email = emailString,
+                        ReceiptNumber = receiptNumber,
+                        FullName = fullName,
+                        Amount = charge.Amount,
+                        DonationDetails = intent.Metadata.GetValueOrDefault("DonationDetails"),
+                        InSupportOf = intent.Metadata.GetValueOrDefault("DonationTowards"),
+                        Phone = intent.Metadata.GetValueOrDefault("Phone"),
+                        Time = DateTimeOffset.UtcNow
+                    };
+
+                ReceiptPdfTemplate pdf = new(receiptData);
+
+                MimeMessage email = new MimeMessage();
+                MailboxAddress from = new MailboxAddress("Makami Foundation", "donation@mef.com");
+                email.From.Add(from);
+                email.Subject = "Donation Receipt";
+                BodyBuilder bodyBuilder = new BodyBuilder();
+                bodyBuilder.HtmlBody =
+                    "<p>Thank you for your donation! Please see the attached PDF receipt of your donation.</p>";
+                bodyBuilder.Attachments.Add("Donation Receipt.pdf", pdf.GeneratePdf());
+                email.Body = bodyBuilder.ToMessageBody();
+
+                SmtpClient client = new SmtpClient();
+
+                await client.ConnectAsync("proxy.makamicollege.com", 25, SecureSocketOptions.None);
+
+                MailboxAddress To = new MailboxAddress(fullName, intent.ReceiptEmail);
+                email.To.Add(To);
+                await client.SendAsync(email);
+                await client.DisconnectAsync(true);
+                client.Dispose();
+
                 return Ok();
             }
             catch (StripeException e)
             {
+                _logger.LogError(e.ToString());
                 return BadRequest();
             }
             catch (Exception e) when (e is not StripeException)
             {
+                _logger.LogError(e.ToString());
                 return StatusCode(StatusCodes.Status500InternalServerError);
             }
         }
